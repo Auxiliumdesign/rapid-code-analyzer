@@ -30,15 +30,6 @@ A Python tool + Tkinter GUI to analyze ABB RAPID code:
   - Option to exclude `NOSTEPIN` modules
   - “Copy summary” button (easy paste into Excel)
 
-## Installation
-
-```bash
-git clone https://github.com/YOUR-USERNAME/rapid-code-analyzer.git
-cd rapid-code-analyzer
-python -m venv .venv
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
 ## Usage (GUI)
 python rapid_analyzer_gui.py
 
@@ -55,3 +46,14 @@ Usage (CLI)
 You can also run the analyzer directly:
 
 python rapid_analyzer.py PATH/TO/FOLDER
+
+## Installation
+
+```bash
+git clone https://github.com/YOUR-USERNAME/rapid-code-analyzer.git
+cd rapid-code-analyzer
+python -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+
