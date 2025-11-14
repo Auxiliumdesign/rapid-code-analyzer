@@ -38,3 +38,20 @@ cd rapid-code-analyzer
 python -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+## Usage (GUI)
+python rapid_analyzer_gui.py
+
+Then:
+
+Choose a folder with RAPID files (.mod, .prg, .sys, .cfg).
+
+Click Analyze.
+
+Explore the Files, Call tree, WaitTimes, and FAQ tabs.
+
+Usage (CLI)
+
+You can also run the analyzer directly:
+
+python rapid_analyzer.py PATH/TO/FOLDER
