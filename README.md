@@ -31,7 +31,10 @@ A Python tool + Tkinter GUI to analyze ABB RAPID code:
   - “Copy summary” button (easy paste into Excel)
 
 ## Usage (GUI)
-python rapid_analyzer_gui.py
+
+Download rapid_analyzer.py and rapid_gui.py and put them in the same folder. From this folder run
+
+python rapid_gui.py 
 
 Then:
 
@@ -50,7 +53,7 @@ python rapid_analyzer.py PATH/TO/FOLDER
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/rapid-code-analyzer.git
+git clone https://github.com/Auxiliumdesign/rapid-code-analyzer.git
 cd rapid-code-analyzer
 python -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
