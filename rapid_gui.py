@@ -36,6 +36,8 @@ class RapidAnalyzerGUI:
 
         # Checkbox state for excluding NOSTEPIN modules
         self.exclude_nostepin_var = tk.BooleanVar(value=True)
+        # Option: treat CallByVar families as single entry (first variant only)
+        self.dynamic_first_only_var = tk.BooleanVar(value=True)
 
         # Per-column Treeview sort state (column -> bool for reverse)
         self.tree_sort_reverse = {}
@@ -69,6 +71,17 @@ class RapidAnalyzerGUI:
             offvalue=False,
         )
         self.exclude_checkbox.pack(side=tk.LEFT, padx=10)
+        
+        # Checkbox: if enabled, only the first variant (e.g. CycleModel_M1)
+        # of each CallByVar family is treated as an entry point.
+        self.dynamic_checkbox = ttk.Checkbutton(
+            top,
+            text="CallByVar: first variant only",
+            variable=self.dynamic_first_only_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.dynamic_checkbox.pack(side=tk.LEFT, padx=10)
 
         # Middle: Notebook with "Files", "Call tree", "WaitTimes", "FAQ"
         middle = ttk.Notebook(self.root)
@@ -91,11 +104,13 @@ class RapidAnalyzerGUI:
         columns = (
             "file",
             "lines",
+            "procs",
+            "comment_pct",
             "complexity",
+            "depth",
             "score",
             "bad_words",
             "unreachable",
-            "unused_vars",
         )
 
         self.tree = ttk.Treeview(
@@ -108,11 +123,13 @@ class RapidAnalyzerGUI:
         headings = {
             "file": "File",
             "lines": "Lines",
-            "complexity": "Complexity",
+            "procs": "Procs",
+            "comment_pct": "Comment %",
+            "complexity": "Simple Complexity",
+            "depth": "Depth complexity",
             "score": "Score",
             "bad_words": "Bad words",
             "unreachable": "Unused procs",
-            "unused_vars": "Unused vars",
         }
 
         for col in columns:
@@ -124,12 +141,14 @@ class RapidAnalyzerGUI:
 
         self.tree.column("file", width=220, anchor=tk.W)
         self.tree.column("lines", width=70, anchor=tk.E)
+        self.tree.column("procs", width=60, anchor=tk.E)
+        self.tree.column("comment_pct", width=90, anchor=tk.E)
         self.tree.column("complexity", width=90, anchor=tk.E)
+        self.tree.column("depth", width=90, anchor=tk.E)
         self.tree.column("score", width=70, anchor=tk.E)
         self.tree.column("bad_words", width=90, anchor=tk.E)
         self.tree.column("unreachable", width=100, anchor=tk.E)
-        self.tree.column("unused_vars", width=100, anchor=tk.E)
-
+        
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -185,6 +204,22 @@ class RapidAnalyzerGUI:
         )
         self.wait_text.configure(yscrollcommand=wait_scroll_y.set)
         wait_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+
+        # -------------------------------------------------
+        # Unused procs tab
+        # -------------------------------------------------
+        unused_tab = ttk.Frame(middle)
+        middle.add(unused_tab, text="Unused procs")
+
+        self.unused_text = tk.Text(unused_tab, wrap=tk.NONE)
+        self.unused_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        unused_scroll_y = ttk.Scrollbar(
+            unused_tab, orient=tk.VERTICAL, command=self.unused_text.yview
+        )
+        self.unused_text.configure(yscrollcommand=unused_scroll_y.set)
+        unused_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
 
         # -------------------------------------------------
         # FAQ tab
@@ -257,20 +292,39 @@ Bad words
         faq_text.config(state=tk.DISABLED)
 
         # -------------------------------------------------
-        # Bottom: summary bar with color background
+        # Bottom: summary bar split into colored segments
         # -------------------------------------------------
         bottom = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.summary_var = tk.StringVar(value="Ready.")
-        self.summary_label = tk.Label(
-            bottom,
-            textvariable=self.summary_var,
-            anchor="w",
-            padx=5,
-            pady=3,
+        # One label per metric so we can color them independently
+        self.summary_files_label = tk.Label(
+            bottom, text="Files: 0", anchor="w", padx=5, pady=3
         )
-        self.summary_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.summary_files_label.pack(side=tk.LEFT)
+
+        self.summary_lines_label = tk.Label(
+            bottom, text="Total lines: 0", anchor="w", padx=5, pady=3
+        )
+        self.summary_lines_label.pack(side=tk.LEFT)
+
+        self.summary_complexity_label = tk.Label(
+            bottom, text="Total complexity: 0", anchor="w", padx=5, pady=3
+        )
+        self.summary_complexity_label.pack(side=tk.LEFT)
+
+        self.summary_score_label = tk.Label(
+            bottom, text="Avg code score: 0/100", anchor="w", padx=5, pady=3
+        )
+        self.summary_score_label.pack(side=tk.LEFT)
+
+        self.summary_vars_label = tk.Label(
+            bottom, text="Unique vars: 0", anchor="w", padx=5, pady=3
+        )
+        self.summary_vars_label.pack(side=tk.LEFT)
+
+        # Store the default background so we can reset to it later
+        self.default_bg = self.summary_files_label.cget("bg")
 
         self.copy_summary_button = ttk.Button(
             bottom,
@@ -283,15 +337,15 @@ Bad words
         self.root.after(50, self._set_initial_sash)
 
     def _set_initial_sash(self) -> None:
-        """Place the sash so the left panel gets most of the width."""
+        """Place the sash so the left panel gets ~70% of the width."""
         total_width = self.files_pane.winfo_width()
         if total_width <= 1:
             # If the widget isn't fully laid out yet, try again shortly.
             self.root.after(50, self._set_initial_sash)
             return
 
-        # Give about 80% of the width to the left pane (table), 20% to details
-        self.files_pane.sashpos(0, int(total_width * 0.5))
+        # Give about 70% of the width to the left pane
+        self.files_pane.sashpos(0, int(total_width * 0.7))
 
     # ---------------- HELPERS ----------------
 
@@ -424,6 +478,62 @@ Bad words
 
     # ---------------- FOLDER / ANALYSIS ----------------
 
+    def update_unused_procs_tab(self) -> None:
+        """Fill the 'Unused procs' tab with unreachable procedures and their code."""
+        if not hasattr(self, "unused_text"):
+            return
+
+        self.unused_text.config(state=tk.NORMAL)
+        self.unused_text.delete("1.0", tk.END)
+
+        if not self.current_results or not self.proc_registry:
+            self.unused_text.insert(tk.END, "No analysis yet.\n")
+            self.unused_text.config(state=tk.DISABLED)
+            return
+
+        # Build a quick lookup: file_path -> {proc_name -> ProcInfo}
+        file_proc_map = {}
+        for fqname, pinfo in self.proc_registry.items():
+            file_proc_map.setdefault(pinfo.file_path, {})[pinfo.proc_name] = pinfo
+
+        any_unused = False
+
+        for res in self.current_results:
+            path = Path(res["file_path"])
+            unused_names = res.get("unreachable_procs", [])
+            if not unused_names:
+                continue
+
+            file_procs = file_proc_map.get(path, {})
+            if not file_procs:
+                continue
+
+            # Header per file that has at least one unused proc
+            self.unused_text.insert(tk.END, f"File: {path}\n")
+
+            for name in unused_names:
+                pinfo = file_procs.get(name)
+                if not pinfo:
+                    continue
+
+                any_unused = True
+
+                self.unused_text.insert(tk.END, f"Procedure: {pinfo.fqname}\n")
+                self.unused_text.insert(tk.END, "-" * 60 + "\n")
+                # body_lines are stored without trailing newlines
+                for line in pinfo.body_lines:
+                    self.unused_text.insert(tk.END, line.rstrip("\n") + "\n")
+                self.unused_text.insert(tk.END, "\n")
+
+            self.unused_text.insert(tk.END, "\n")
+
+        if not any_unused:
+            self.unused_text.insert(
+                tk.END, "No unused / unreachable procedures found.\n"
+            )
+
+        self.unused_text.config(state=tk.DISABLED)
+
     def sort_by_column(self, col: str) -> None:
         """Sort the treeview by the given column. Click again to reverse the order."""
         items = list(self.tree.get_children(""))
@@ -432,12 +542,15 @@ Bad words
 
         numeric_cols = {
             "lines",
+            "procs",
             "complexity",
+            "comment_pct",
+            "depth",
             "score",
             "bad_words",
             "unreachable",
-            "unused_vars",
         }
+
 
         def to_number(value: str):
             if not isinstance(value, str):
@@ -480,7 +593,10 @@ Bad words
             return
 
         self.analyze_button.config(state=tk.DISABLED)
-        self.summary_var.set("Analyzing... this may take a moment.")
+        # Show simple “busy” state in the first summary label
+        self.summary_files_label.config(
+            text="Analyzing...", bg=self.default_bg
+        )
         self.root.update_idletasks()
 
         try:
@@ -493,11 +609,14 @@ Bad words
             ) = ra.analyze_folder(
                 path,
                 exclude_nostepin_modules=self.exclude_nostepin_var.get(),
+                dynamic_all_variants=not self.dynamic_first_only_var.get(),
             )
-        except Exception as e:  # simple GUI app
+        except Exception as e:  # noqa: BLE001 (simple GUI app)
             messagebox.showerror("Error during analysis", str(e))
             self.analyze_button.config(state=tk.NORMAL)
-            self.summary_var.set("Error.")
+            self.summary_files_label.config(
+                text="Error.", bg=self.default_bg
+            )
             return
 
         self.current_results = results
@@ -509,6 +628,9 @@ Bad words
         self.update_summary()
         self.update_call_tree()
         self.update_waittime_tab()
+        self.update_unused_procs_tab()
+
+        
 
         self.analyze_button.config(state=tk.NORMAL)
 
@@ -524,9 +646,6 @@ Bad words
             bad_words = res.get("bad_words", [])
             bad_words_count = len(bad_words)
             unreachable_count = res.get("unreachable_count", 0)
-            unused_count = res.get(
-                "unused_var_count", len(res.get("unused_vars", []))
-            )
 
             self.tree.insert(
                 "",
@@ -535,11 +654,13 @@ Bad words
                 values=(
                     file_name,
                     res["total_lines"],
+                    res["proc_count"],
+                    f"{res['comment_ratio']:.0f}%",
                     res["simple_complexity"],
+                    res["depth_complexity"],
                     f"{res['readability_score']:.0f}",
                     bad_words_count,
                     unreachable_count,
-                    unused_count,
                 ),
             )
 
@@ -552,10 +673,16 @@ Bad words
             self.show_details_for_index(0)
 
     def update_summary(self) -> None:
-        """Update the bottom summary text and background color based on avg score."""
+        """Update the bottom summary labels and colors based on metrics."""
         if not self.current_results:
-            self.summary_var.set("No RAPID files found.")
-            self.summary_label.config(bg=self.root.cget("bg"))
+            # Reset labels to neutral state
+            self.summary_files_label.config(
+                text="No RAPID files found.", bg=self.default_bg
+            )
+            self.summary_lines_label.config(text="", bg=self.default_bg)
+            self.summary_complexity_label.config(text="", bg=self.default_bg)
+            self.summary_score_label.config(text="", bg=self.default_bg)
+            self.summary_vars_label.config(text="", bg=self.default_bg)
             return
 
         total_files = len(self.current_results)
@@ -566,28 +693,82 @@ Bad words
             for res in self.current_results
         )
 
-        avg_score = (
+        # Raw average score
+        raw_avg_score = (
             sum(res["readability_score"] for res in self.current_results)
             / total_files
         )
 
-        self.summary_var.set(
-            f"Files: {total_files} | Total lines: {total_lines} | "
-            f"Total complexity: {total_complexity:.0f} | "
-            f"Avg code score: {avg_score:.0f}/100 | "
-            f"Unique variables (project): {self.current_project_vars}"
+        # Cap: average of the three worst modules + 40
+        all_scores = [res["readability_score"] for res in self.current_results]
+        all_scores.sort()
+        if all_scores:
+            worst_scores = all_scores[:3]  # if <3 files, just use all of them
+            worst_avg = sum(worst_scores) / len(worst_scores)
+            avg_score = min(raw_avg_score, worst_avg + 40.0)
+        else:
+            avg_score = raw_avg_score
+
+        
+        if total_files > 10:
+            total_files_penalty = min(30,(total_files-10))
+        else:
+            total_files_penalty = 0.0
+            
+        avg_score -= total_files_penalty
+        # ---------------- Color rules ----------------
+        # Files:
+        #   > 14 -> red
+        #   > 6  -> yellow
+        #   else -> green
+        if total_files > 14:
+            files_bg = "#ffd6d6"  # red-ish
+        elif total_files > 6:
+            files_bg = "#fff5cc"  # yellow-ish
+        else:
+            files_bg = "#ccffcc"  # green-ish
+
+        # Total complexity:
+        #   > 10000 -> red
+        #   < 2000  -> green
+        #   else    -> yellow
+        if total_complexity > 10000:
+            comp_bg = "#ffd6d6"
+        elif total_complexity < 2000:
+            comp_bg = "#ccffcc"
+        else:
+            comp_bg = "#fff5cc"
+
+        # Avg score (keep previous logic):
+        #   >= 80 -> green
+        #   >= 50 -> yellow
+        #   else  -> red
+        if avg_score >= 80:
+            score_bg = "#ccffcc"
+        elif avg_score >= 50:
+            score_bg = "#fff5cc"
+        else:
+            score_bg = "#ffd6d6"
+
+        # ---------------- Apply labels ----------------
+        self.summary_files_label.config(
+            text=f"Files: {total_files}", bg=files_bg
+        )
+        self.summary_lines_label.config(
+            text=f"Total lines: {total_lines}", bg=self.default_bg
+        )
+        self.summary_complexity_label.config(
+            text=f"Total complexity: {total_complexity:.0f}", bg=comp_bg
+        )
+        self.summary_score_label.config(
+            text=f"Project code score: {avg_score:.0f}/100", bg=score_bg
+        )
+        self.summary_vars_label.config(
+            text=f"Unique vars: {self.current_project_vars}",
+            bg=self.default_bg,
         )
 
-        if avg_score >= 80:
-            bg = "#ccffcc"  # light green
-        elif avg_score >= 50:
-            bg = "#fff5cc"  # light yellow
-        else:
-            bg = "#ffd6d6"  # light red
-
-        self.summary_label.config(bg=bg)
-
-    def on_tree_select(self, event) -> None:
+    def on_tree_select(self, event) -> None:  # noqa: D401 (Tk callback)
         """Handle selection change in the summary table."""
         selection = self.tree.selection()
         if not selection:
@@ -648,14 +829,22 @@ Bad words
         unused_vars = res.get("unused_vars", [])
         lines.append("")
         lines.append(f"Unused variables:     {len(unused_vars)}")
+
         if unused_vars:
+            # Show at most the first 20 variables in the GUI
+            display_vars = unused_vars[:20]
+            remaining = len(unused_vars) - len(display_vars)
+
             lines.extend(
                 self.wrap_list_for_display(
-                    unused_vars,
+                    display_vars,
                     prefix="  Names:              ",
                     max_per_line=5,
                 )
             )
+
+            if remaining > 0:
+                lines.append(f"  ...and {remaining} more")
 
         lines.append("")
         lines.append(f"Unique variables:     {res['variable_count']}")
@@ -690,6 +879,28 @@ Bad words
 
         lines.append("")
         lines.append(f"Overall code score:   {res['readability_score']:.0f} / 100")
+
+        # ---------- NEW: score breakdown ----------
+        lines.append("")
+        lines.append("Score breakdown:")
+
+        def fmt(key: str) -> float:
+            return float(res.get(key, 0.0))
+
+        lines.append(f"  Complexity penalty: {fmt('complexity_penalty'):6.1f}")
+        lines.append(f"  Nesting penalty:    {fmt('nesting_penalty'):6.1f}")
+        lines.append(f"  Call-depth penalty: {fmt('call_depth_penalty'):6.1f}")
+        lines.append(f"  Proc-count penalty: {fmt('proc_count_penalty'):6.1f}")
+        lines.append(f"  Proc-size penalty:  {fmt('proc_size_penalty'):6.1f}")
+        lines.append(f"  Line count penalty:  {fmt('total_line_penalty'):6.1f}")
+        lines.append(f"  Bad-word penalty:   {fmt('bad_word_penalty'):6.1f}")
+        lines.append(f"  Unused-var penalty: {fmt('unused_var_penalty'):6.1f}")
+        lines.append(f"  Comment penalty:      {fmt('comment_penalty'):6.1f}")
+
+        total_pen = fmt("total_penalty")
+        lines.append(f"  Total penalty:      {total_pen:6.1f}")
+        lines.append(f"  Base score (100 - penalties ): "
+                     f"{100.0 - total_pen:6.1f}")
 
         return "\n".join(lines)
 
