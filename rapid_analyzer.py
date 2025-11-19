@@ -39,7 +39,7 @@ ALLOWED_SHORT_TOKENS: Set[str] = {
     "via", "Via", "m", "bool", "plc", "pre", "off",
     "with", "from", "x", "y", "z", "ry", "rz", "rx",
     "dir", "calc", "prog", "pers", "i", "j", "k", "a",
-    "b", "ok", "at",
+    "b", "ok", "at","for","over","under","front","back","cc","ct","v",
 }
 
 # -------------------------------------------------
@@ -224,24 +224,34 @@ def variable_name_score(all_variables: Iterable[str]) -> Tuple[float, Set[str]]:
 def comment_score(comment_ratio: float) -> float:
     """
     Returns a score 0–1 based on how healthy the comment ratio is.
-    Ideal: around 15–25%. Too few or too many reduces score.
 
-    comment_ratio is expected in [0, 1].
+    comment_ratio is expected in [0, 1] (0–100%).
+
+    Behaviour:
+      - 0% comments          -> score 0
+      - 6% comments          -> score 1  (linear ramp 0 → 1)
+      - 6%–25% comments      -> score 1  (ideal plateau)
+      - 25%–60% comments     -> linearly drops 1 → 0
+      - >= 60% comments      -> score 0
     """
-    if comment_ratio <= 0:
+    if comment_ratio <= 0.0:
         return 0.0
 
-    if comment_ratio < 0.05:  # 0–5%
-        return 0.7 * (comment_ratio / 0.05)  # 0 → 0.7
+    # 0–6%: ramp from 0 to 1
+    if comment_ratio < 0.06:
+        return comment_ratio / 0.06
 
-    if 0.05 <= comment_ratio <= 0.25:  # 5–25%
-        return 0.7 + 0.8 * ((comment_ratio - 0.05) / 0.20)  # 0.7 → 1.5 (clamped later)
+    # 6–25%: optimal range, full score
+    if comment_ratio <= 0.25:
+        return 1.0
 
-    if comment_ratio > 0.25:  # >25%
-        # Drops linearly from 1.0 at 25% to 0.3 at ~60%
-        return max(0.1, 1.0 - (comment_ratio - 0.25) * 2.0)
+    # >25%: linearly decrease from 1 at 25% to 0 at 60%
+    if comment_ratio >= 0.60:
+        return 0.0
 
-    return 0.0
+    # Linear interpolation between 25% and 60%
+    return 1.0 - (comment_ratio - 0.25) / (0.60 - 0.25)
+
 
 
 # -------------------------------------------------
@@ -318,7 +328,7 @@ def analyze_file_first_pass(
     var_uses: Set[str] = set()      # names used in this file (identifiers)
 
     # Unicode-safe identifier start: any word char except digit
-    name_regex = r"[^\W\d_][^\W_]*"
+    name_regex = r"[^\W\d_]\w*"
 
     # WaitTime tracking
     waittime_lines: List[int] = []
@@ -327,9 +337,12 @@ def analyze_file_first_pass(
     func_pattern = re.compile(rf"^\s*FUNC\s+\w+\s+({name_regex})", re.IGNORECASE)
     endproc_pattern = re.compile(r"^\s*ENDPROC\b", re.IGNORECASE)
     endfunc_pattern = re.compile(r"^\s*ENDFUNC\b", re.IGNORECASE)
-    callbyvar_pattern = re.compile(r'CallByVar\s+"([^\W\d_][^\W_]*)"', re.IGNORECASE)
+    callbyvar_pattern = re.compile(
+        r'\bCallByVar\b[^\n"]*"([^"]+)"',
+        re.IGNORECASE,
+    )
     dynamic_call_prefixes: Set[str] = set()
-    ident_pattern = re.compile(r"\b[^\W\d_][^\W_]*\b", re.UNICODE)
+    ident_pattern = re.compile(r"\b[^\W\d_]\w*\b", re.UNICODE)
 
     var_decl_pattern = re.compile(
         rf"^\s*(PERS|VAR|CONST|LOCAL)\s+\w+\s+({name_regex})",
@@ -376,7 +389,7 @@ def analyze_file_first_pass(
             current_module = None
 
         # --- Ignore decorative comments starting with !**** ---
-        if stripped.startswith("!****"):
+        if stripped.startswith("!**") or stripped.startswith("!--"):
             if DEBUG and DEBUG_VARS:
                 print(f"  Ignoring decorative comment line: {line}")
             continue
@@ -442,8 +455,10 @@ def analyze_file_first_pass(
 
         m = callbyvar_pattern.search(line)
         if m:
-            prefix = m.group(1)
-            dynamic_call_prefixes.add(prefix.lower())
+            prefix = m.group(1).strip()
+            if prefix:
+                dynamic_call_prefixes.add(prefix.lower())
+
 
         m = setdo_pattern.search(line)
         if m:
@@ -570,27 +585,49 @@ def print_call_tree_from_main(call_graph: Dict[str, Set[str]], main_candidates: 
 def build_call_graph(
     proc_registry: Dict[str, ProcInfo],
     proc_name_to_fq: Dict[str, Set[str]],
+    dynamic_all_variants: bool = True,
 ) -> Dict[str, Set[str]]:
     """
     Second pass: build call graph between procedures across all files.
     Case-insensitive, Unicode-safe.
+
     Skips:
       - lines starting with '!'  (comments)
       - lines starting with 'TPWrite' (pure HMI text)
+
+    In addition to normal static calls, it also treats CallByVar as a
+    real call:
+
+        CallByVar "CycleModel_M", nModel;
+
+    will be treated as calls to:
+      - ALL procedures whose names start with "CycleModel_M"
+        if dynamic_all_variants == True
+      - ONLY the first such procedure (lexicographically)
+        if dynamic_all_variants == False
     """
     if DEBUG:
         print("\n=== Building call graph ===")
 
     call_graph: Dict[str, Set[str]] = defaultdict(set)
 
-    # known names stored in lowercase
+    # known names stored in lowercase (exact proc names)
     known_proc_names = set(proc_name_to_fq.keys())
 
-    ident_pattern = re.compile(r"\b[^\W\d_][^\W_]*\b", re.UNICODE)
+    ident_pattern = re.compile(r"\b[^\W\d_]\w*\b", re.UNICODE)
+    # Matches:
+    #   CallByVar "CycleModel_M", nModel;
+    #   CallByVar \Task:="T_ROB2","CycleModel_M",nModel;
+    #   CallByVar \Something, "Leave130_P", Recept;
+    callbyvar_pattern = re.compile(
+        r"\bCallByVar\b[^\n\"]*\"([^\"]+)\"",
+        re.IGNORECASE,
+    )
 
     for fqname, pinfo in proc_registry.items():
         if DEBUG and DEBUG_VARS:
             print(f"  Scanning body of proc: {fqname}")
+
         for line in pinfo.body_lines:
             stripped = line.lstrip()
             upper = stripped.upper()
@@ -601,10 +638,11 @@ def build_call_graph(
                     print(f"    Skipping line (comment/TPWrite): {line.rstrip()}")
                 continue
 
-            # Strip inline comments and strings
+            # Strip inline comments and strings for *static* call scanning
             line_no_comment = stripped.split("!", 1)[0]
             line_no_strings = re.sub(r'"[^"]*"', "", line_no_comment)
 
+            # ---------- Static calls (as before) ----------
             for ident in ident_pattern.findall(line_no_strings):
                 ident_l = ident.lower()
                 if ident_l in known_proc_names:
@@ -612,9 +650,57 @@ def build_call_graph(
                         call_graph[fqname].add(callee_fq)
                         if DEBUG and DEBUG_VARS:
                             print(
-                                f"    Call detected: {fqname} -> {callee_fq} "
+                                f"    Static call: {fqname} -> {callee_fq} "
                                 f"(from ident '{ident}')"
                             )
+
+            # ---------- Dynamic calls via CallByVar ----------
+            m_dyn = callbyvar_pattern.search(stripped)
+            if not m_dyn:
+                continue
+
+            prefix_raw = m_dyn.group(1).strip()
+            if not prefix_raw:
+                continue
+
+            prefix_lc = prefix_raw.lower()
+
+            # Find *all* procedures whose names start with this prefix
+            matching_proc_names = [
+                name for name in proc_name_to_fq.keys()
+                if name.startswith(prefix_lc)
+            ]
+
+            if not matching_proc_names:
+                if DEBUG and DEBUG_VARS:
+                    print(
+                        f"    CallByVar '{prefix_raw}' in {fqname} "
+                        f"has no matching procedures."
+                    )
+                continue
+
+            # If we only want the first variant, pick exactly ONE proc name
+            if dynamic_all_variants:
+                selected_proc_names = matching_proc_names
+            else:
+                # One representative per prefix family, e.g. only 'cyclemodel_m1'
+                selected_proc_names = [sorted(matching_proc_names)[0]]
+
+            for proc_name in selected_proc_names:
+                fq_list = sorted(proc_name_to_fq[proc_name])
+
+                if dynamic_all_variants:
+                    targets = fq_list          # all modules that define that proc
+                else:
+                    targets = [fq_list[0]]     # first module only, if multiple
+
+                for callee_fq in targets:
+                    call_graph[fqname].add(callee_fq)
+                    if DEBUG and DEBUG_VARS:
+                        print(
+                            f"    CallByVar '{prefix_raw}' treated as "
+                            f"call: {fqname} -> {callee_fq}"
+                        )
 
     if DEBUG and DEBUG_VARS:
         print("\nCall graph edges:")
@@ -632,10 +718,12 @@ def compute_call_depths_from_main(
 ) -> Dict[str, int]:
     """
     Compute call-chain depth starting ONLY from 'Main' or 'main'.
-    Depth(proc) = distance from Main in call graph.
-    Procedures not reachable from Main get depth = 0.
 
-    If no MAIN-like entry point is found, all depths are 0.
+    Depth(proc) = distance from MAIN in call graph.
+    Procedures not reachable from MAIN get no entry in the dict.
+
+    Dynamic calls (CallByVar) are already encoded as normal edges
+    in the call graph.
     """
     main_candidates = [
         p for p in call_graph.keys()
@@ -666,7 +754,9 @@ def compute_call_depths_from_main(
         current_depth = depth[current]
 
         for callee in call_graph.get(current, []):
-            if callee not in depth or depth[callee] < current_depth + 1:
+            # Only set depth the first time we see a node, so recursion /
+            # mutual recursion does not grow depth forever.
+            if callee not in depth:
                 depth[callee] = current_depth + 1
                 queue.append(callee)
 
@@ -676,6 +766,8 @@ def compute_call_depths_from_main(
             print(f"  {proc} -> depth {d}")
 
     return depth
+
+
 
 
 # -------------------------------------------------
@@ -695,6 +787,7 @@ def compute_file_scores(
     """
     results: List[Dict] = []
 
+    total_files = len(file_stats_list)
     # Map file -> list of procs
     file_to_procs: Dict[Path, List[ProcInfo]] = defaultdict(list)
     for fqname, pinfo in proc_registry.items():
@@ -730,7 +823,7 @@ def compute_file_scores(
         # variable_name_score returns (0–1 score, set of bad tokens)
         vscore_raw, bad_tokens = variable_name_score(variable_names)
         vscore = vscore_raw * 100
-
+        bad_word_count = len(bad_tokens)
         # Procedure stats
         procs = file_to_procs.get(path, [])
         proc_count = len(procs)
@@ -775,12 +868,12 @@ def compute_file_scores(
 
         # ---- Penalties & boosts ----
 
-        complexity_penalty = max(0.0, (simple_complexity - 50) * 2.0)
-        nesting_penalty = max(0.0, (max_nesting - 10) * 10.0)
+        complexity_penalty = min(30, max(0.0,(simple_complexity - 50) * 1))
+        nesting_penalty = min(30, max(0.0,(max_nesting - 8) * 5))
         call_depth_penalty = min(50.0, max(0.0, (file_max_call_depth - 3) * 15.0))
 
         if proc_count > 20:
-            proc_count_penalty = min(40.0, (proc_count - 20) * 1.5)
+            proc_count_penalty = min(20.0, (proc_count - 20) * 1)
         else:
             proc_count_penalty = 0.0
 
@@ -789,13 +882,18 @@ def compute_file_scores(
         else:
             proc_size_penalty = 0.0
 
+
         # Penalty for very large files (more than 600 total lines)
         if total_lines > 600 and proc_count > 1:
-            total_line_penalty = (total_lines - 600) * 0.05
+            total_line_penalty = min(20,(total_lines - 600) * 0.05)
         else:
             total_line_penalty = 0.0
 
-        comment_boost = cscore * 0.1
+        
+        unused_var_penalty = min(20, unused_var_count*0.5)
+        bad_word_penalty = min(20, bad_word_count*0.5)
+        
+        comment_penalty = 5-cscore * 0.05 
 
         base = 100.0
         total_penalty = (
@@ -805,10 +903,12 @@ def compute_file_scores(
             + proc_count_penalty
             + proc_size_penalty
             + total_line_penalty
+            + bad_word_penalty
+            + unused_var_penalty
+            + comment_penalty
         )
-        total_boost = comment_boost
 
-        readability_score = base - total_penalty + total_boost
+        readability_score = base - total_penalty
         readability_score = max(0.0, min(100.0, readability_score))
 
         if DEBUG:
@@ -825,8 +925,8 @@ def compute_file_scores(
                 f"proccount={proc_count_penalty:.2f}, "
                 f"procsize={proc_size_penalty:.2f}, "
                 f"totallines={total_line_penalty:.2f}"
+                f"comments={comment_penalty:.2f}"
             )
-            print(f"  boosts: comments={comment_boost:.2f}")
             print(f"  => readability_score={readability_score:.2f}")
 
         results.append({
@@ -855,6 +955,16 @@ def compute_file_scores(
             "waittime_count": len(waittime_lines),
             "unused_vars": unused_vars,
             "unused_var_count": unused_var_count,
+            "complexity_penalty": complexity_penalty,
+            "nesting_penalty": nesting_penalty,
+            "call_depth_penalty": call_depth_penalty,
+            "proc_count_penalty": proc_count_penalty,
+            "proc_size_penalty": proc_size_penalty,
+            "total_line_penalty": total_line_penalty,
+            "bad_word_penalty": float(bad_word_penalty),
+            "unused_var_penalty": float(unused_var_penalty),
+            "comment_penalty": comment_penalty,
+            "total_penalty": total_penalty,
         })
 
     return results
@@ -867,7 +977,9 @@ def compute_file_scores(
 def analyze_folder(
     root_folder: Path,
     exclude_nostepin_modules: bool = True,
+    dynamic_all_variants: bool = True,
 ):
+
     """
     Main orchestration:
       - First pass: parse files, gather stats & procedures
@@ -913,7 +1025,11 @@ def analyze_folder(
     project_unique_var_count = len(all_variables)
 
     # SECOND PASS: call graph + depths
-    call_graph = build_call_graph(proc_registry, proc_name_to_fq)
+    call_graph = build_call_graph(
+        proc_registry,
+        proc_name_to_fq,
+        dynamic_all_variants=dynamic_all_variants,
+    )
     call_depths = compute_call_depths_from_main(call_graph)
 
     # THIRD PASS: per-file scores
@@ -925,6 +1041,7 @@ def analyze_folder(
         all_dynamic_prefixes,
         project_used_vars,
     )
+
 
     return file_results, project_unique_var_count, call_graph, proc_registry
 
@@ -999,14 +1116,27 @@ def print_results(file_results: List[Dict], project_unique_var_count: int) -> No
         print(f"  Overall code score:    {res['readability_score']:.0f} / 100")
 
     avg_complexity /= max(total_files, 1)
-    avg_readability /= max(total_files, 1)
+
+    # Raw average of all file scores
+    raw_avg_score = avg_readability / max(total_files, 1)
+
+    # Cap: average of the three worst modules + 40
+    all_scores = [res["readability_score"] for res in file_results]
+    all_scores.sort()
+    if all_scores:
+        worst_scores = all_scores[:3]  # if <3 files, this will just be all of them
+        worst_avg = sum(worst_scores) / len(worst_scores)
+        capped_avg_score = min(raw_avg_score, worst_avg + 40.0)
+    else:
+        capped_avg_score = raw_avg_score
 
     print("\n=== PROJECT SUMMARY ===")
     print(f"Files analyzed:          {total_files}")
     print(f"Total project lines:     {total_project_lines}")
     print(f"Average complexity:      {avg_complexity:.0f}")
-    print(f"Average Code Score:      {avg_readability:.0f} / 100")
+    print(f"Average Code Score:      {capped_avg_score:.0f} / 100")
     print(f"Unique variables:        {project_unique_var_count}\n")
+
 
 
 # -------------------------------------------------
